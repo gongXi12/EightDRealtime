@@ -1,0 +1,15 @@
+bin/
+obj/
+.vs/
+App/*.dll
+App/*.exe
+App/*.json
+dist/
+dist-fixed/
+dist-clean/
+dist-8d/
+dist-audible/
+dist-circle/
+dist-layered-8d/
+dist-crown-8d/
+dist-polished-ui/
