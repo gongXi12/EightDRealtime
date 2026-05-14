@@ -7,6 +7,9 @@ internal sealed class StereoRingBuffer
     private int _readFrame;
     private int _writeFrame;
     private int _availableFrames;
+    private float _lastLeft;
+    private float _lastRight;
+    private bool _hasData;
 
     public StereoRingBuffer(int capacityFrames)
     {
@@ -45,6 +48,9 @@ internal sealed class StereoRingBuffer
             _writeFrame = (_writeFrame + 1) % _capacityFrames;
         }
 
+        _lastLeft = source[(sourceOffsetFrame + frames - 1) * 2];
+        _lastRight = source[(sourceOffsetFrame + frames - 1) * 2 + 1];
+        _hasData = true;
         _availableFrames += frames;
     }
 
@@ -58,6 +64,17 @@ internal sealed class StereoRingBuffer
             target[targetIndex] = _buffer[sourceIndex];
             target[targetIndex + 1] = _buffer[sourceIndex + 1];
             _readFrame = (_readFrame + 1) % _capacityFrames;
+        }
+
+        // Fill underrun frames with last known sample to avoid hard clicks.
+        if (_hasData && framesToRead < frames)
+        {
+            for (var frame = framesToRead; frame < frames; frame++)
+            {
+                var targetIndex = frame * 2;
+                target[targetIndex] = _lastLeft;
+                target[targetIndex + 1] = _lastRight;
+            }
         }
 
         _availableFrames -= framesToRead;

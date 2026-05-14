@@ -16,7 +16,10 @@ public sealed class Wasapi8DAudioEngine : IDisposable
     private readonly object _settingsLock = new();
     private Thread? _worker;
     private volatile bool _stopRequested;
-    private SpatialSettings _settings = SpatialSettings.FromPreset(SpatialPreset.Default);
+    private SpatialSettings _settings = new(
+        Enabled: true, InputGain: 0.84f, OutputGain: 0.80f, RotationHz: 0.12f,
+        Depth: 0.90f, CircleStrength: 3.00f, HrtfStrength: 1.00f,
+        ReverbWet: 0.28f, LimiterThreshold: 0.88f);
 
     public event EventHandler<string>? StatusChanged;
     public event EventHandler<double>? LatencyChanged;
@@ -318,11 +321,7 @@ public sealed class Wasapi8DAudioEngine : IDisposable
         }
 
         EnsureCapacity(ref outputBuffer, checked((int)availableFrames) * 2);
-        var validFrames = queue.Read(outputBuffer, checked((int)availableFrames));
-        if (validFrames < availableFrames)
-        {
-            Array.Clear(outputBuffer, validFrames * 2, (checked((int)availableFrames) - validFrames) * 2);
-        }
+        queue.Read(outputBuffer, checked((int)availableFrames));
 
         CoreAudioInterop.Check(render.GetBuffer(availableFrames, out var data), "无法获取输出缓冲区。");
         AudioBufferConverter.WriteFromStereo(data, availableFrames, renderFormat, outputBuffer, checked((int)availableFrames));

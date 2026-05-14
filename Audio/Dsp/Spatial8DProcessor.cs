@@ -1,5 +1,11 @@
 namespace EightDRealtime.Audio.Dsp;
 
+/// <summary>
+/// 8D 水平环绕处理器。
+/// 声音在平行于地面的圆上旋转：左 → 前 → 右 → 后 → 左。
+/// 左右感来自 ITD（耳间时间差）+ ILD（耳间声级差）。
+/// 前后感来自混响量和频谱变化（后方更暗、混响更多；前方更亮、更直接）。
+/// </summary>
 public sealed class Spatial8DProcessor
 {
     private const float TwoPi = MathF.PI * 2f;
@@ -8,12 +14,16 @@ public sealed class Spatial8DProcessor
     private readonly FractionalDelayLine _rightDelay;
     private readonly OnePoleLowpass _leftLow;
     private readonly OnePoleLowpass _rightLow;
-    private readonly OnePoleLowpass _leftHighReference;
-    private readonly OnePoleLowpass _rightHighReference;
-    private readonly OnePoleLowpass _heightSmoother;
+    private readonly BiquadPeakFilter _rearShadowL;
+    private readonly BiquadPeakFilter _rearShadowR;
+    private readonly BiquadPeakFilter _frontPresenceL;
+    private readonly BiquadPeakFilter _frontPresenceR;
     private readonly SimpleStereoReverb _reverb;
-    private float _orbitPhase = -MathF.PI / 2f;
-    private float _heightPhase = -MathF.PI / 2f;
+    private float _orbitPhase;
+    private float _lastRearGainDb = float.NaN;
+    private float _lastFrontGainDb = float.NaN;
+    private float _rearBlend;  // 0 = off, 1 = full
+    private float _frontBlend; // 0 = off, 1 = full
 
     public Spatial8DProcessor(int sampleRate)
     {
@@ -23,9 +33,10 @@ public sealed class Spatial8DProcessor
         _rightDelay = new FractionalDelayLine(maxDelaySamples);
         _leftLow = new OnePoleLowpass(0.020f);
         _rightLow = new OnePoleLowpass(0.020f);
-        _leftHighReference = new OnePoleLowpass(0.16f);
-        _rightHighReference = new OnePoleLowpass(0.16f);
-        _heightSmoother = new OnePoleLowpass(0.006f);
+        _rearShadowL = new BiquadPeakFilter();
+        _rearShadowR = new BiquadPeakFilter();
+        _frontPresenceL = new BiquadPeakFilter();
+        _frontPresenceR = new BiquadPeakFilter();
         _reverb = new SimpleStereoReverb(_sampleRate);
     }
 
@@ -54,16 +65,17 @@ public sealed class Spatial8DProcessor
         }
 
         var depth = Clamp(settings.Depth, 0f, 1f);
-        var circle = Clamp(settings.CircleStrength, 0f, 1f);
-        var heightDepth = Clamp(settings.HeightDepth, 0f, 1f);
-        var heightRate = Clamp(settings.HeightRate, 0.25f, 2.5f);
+        var circle = Clamp(settings.CircleStrength, 0f, 4f);
         var hrtf = Clamp(settings.HrtfStrength, 0f, 1f);
         var baseReverb = Clamp(settings.ReverbWet, 0f, 0.65f);
         var orbitStep = TwoPi * Clamp(settings.RotationHz, 0f, 0.75f) / _sampleRate;
-        var heightStep = orbitStep * heightRate;
-        var dryKeep = 1f - depth * (0.68f + circle * 0.18f);
-        var movingGain = 0.78f + depth * 0.56f;
-        var maxItdSamples = _sampleRate * (0.00030f + 0.00055f * hrtf) * circle;
+
+        // ITD: 最大延迟约 0.7ms（对应头部半径 ~10cm 的最大路径差）
+        var maxItdSamples = _sampleRate * 0.00070f * hrtf;
+
+        // Dry/wet mix: depth 控制空间效果强度
+        var wetMix = depth;
+        var dryMix = 1f - depth * 0.65f;
 
         for (var frame = 0; frame < frames; frame++)
         {
@@ -71,88 +83,89 @@ public sealed class Spatial8DProcessor
             var leftIn = interleavedStereo[i] * inputGain;
             var rightIn = interleavedStereo[i + 1] * inputGain;
 
+            // --- 低频分离：bass 固定居中锚定，避免低频飘移 ---
             var lowLeft = _leftLow.Process(leftIn);
             var lowRight = _rightLow.Process(rightIn);
-            var lowCenter = (lowLeft + lowRight) * 0.5f;
-            var highLeft = leftIn - lowLeft;
-            var highRight = rightIn - lowRight;
-            var highMid = (highLeft + highRight) * 0.5f;
-            var highSide = (highLeft - highRight) * 0.5f;
+            var bassCenter = (lowLeft + lowRight) * 0.5f;
 
-            // Vertical crown orbit: left/right panning and up/down cues share the same round path.
-            var horizontal = MathF.Sin(_orbitPhase);
-            var heightRaw = MathF.Cos(_heightPhase);
-            var smoothedHeight = _heightSmoother.Process(heightRaw);
-            var shapedHeight = ShapeHeight(smoothedHeight);
-            var height = shapedHeight * heightDepth;
-            var verticalAmount = Clamp(MathF.Abs(height), 0f, 1f);
-            var orbitX = horizontal * circle * (1f - verticalAmount * 0.42f);
-            var lateral = MathF.Abs(orbitX);
-            var up = Smooth01(Clamp(height * 1.22f, 0f, 1f));
-            var down = Smooth01(Clamp(-height * 1.22f, 0f, 1f));
+            // --- 水平环绕轨道 ---
+            // 0 = 左, π/2 = 前, π = 右, 3π/2 = 后
+            var cosA = MathF.Cos(_orbitPhase);
+            var sinA = MathF.Sin(_orbitPhase);
 
-            var movingSource = highMid + highSide * (0.18f * (1f - circle));
-            var heightAirLeft = movingSource - _leftHighReference.Process(movingSource);
-            var heightAirRight = movingSource - _rightHighReference.Process(movingSource);
-            var heightAir = (heightAirLeft + heightAirRight) * 0.5f;
-            var upperAir = up * heightDepth * (0.42f + 0.58f * hrtf);
-            var lowerWarmth = down * heightDepth * (0.25f + 0.18f * hrtf);
-            movingSource *= 1f + up * (0.05f + 0.05f * hrtf) - down * (0.07f + 0.04f * hrtf);
-            movingSource += heightAir * upperAir;
-            movingSource += lowCenter * lowerWarmth;
-            movingSource *= 1f / (1f + up * 0.12f + down * 0.09f);
+            // ILD（声级差）：equal-power panning，水平分量
+            var leftGain = MathF.Sqrt(Clamp((1f + cosA) * 0.5f, 0f, 1f));
+            var rightGain = MathF.Sqrt(Clamp((1f - cosA) * 0.5f, 0f, 1f));
 
-            var leftGain = MathF.Sqrt(Clamp((1f - orbitX) * 0.5f, 0f, 1f));
-            var rightGain = MathF.Sqrt(Clamp((1f + orbitX) * 0.5f, 0f, 1f));
-            var farEarShadow = lateral * (0.24f + 0.28f * hrtf);
-            if (orbitX > 0f)
+            // ITD（时间差）：仅由头部尺寸决定，不受环绕范围影响
+            // 左声道：声源在右时延迟（cosA < 0 → 远耳是左耳），声源在左时不延迟
+            // 右声道：声源在左时延迟（cosA > 0 → 远耳是右耳），声源在右时不延迟
+            var itdLeft = cosA < 0f ? -cosA * maxItdSamples : 0f;
+            var itdRight = cosA > 0f ? cosA * maxItdSamples : 0f;
+
+            // 空间化信号：左右声道分别进入延迟线，保留原始立体声宽度
+            var spatialLeft = _leftDelay.Process(leftIn, itdLeft) * leftGain;
+            var spatialRight = _rightDelay.Process(rightIn, itdRight) * rightGain;
+
+            // --- 前后频谱处理 ---
+            // sin > 0 = 后方（head shadow: 高频衰减）, sin < 0 = 前方（presence boost）
+            var rear = Clamp(sinA * circle, 0f, 1f);
+            var front = Clamp(-sinA * circle, 0f, 1f);
+
+            // 迟滞区间：避免在阈值附近反复开/关导致咔嗒声
+            // 开启阈值 0.08，关闭阈值 0.04
+            _rearBlend = rear > 0.08f ? 1f : rear < 0.04f ? 0f : _rearBlend;
+            _frontBlend = front > 0.08f ? 1f : front < 0.04f ? 0f : _frontBlend;
+
+            if (_rearBlend > 0f)
             {
-                leftGain *= 1f - farEarShadow;
-                rightGain *= 1f + lateral * 0.08f;
+                // Head shadow: 只削弱 4.5kHz 附近的中高频（峰值），不影响低频
+                var rearGainDb = -4f * rear * hrtf;
+                // 仅在系数变化 > 0.3dB 时重算，避免每样本更新导致的噪声
+                if (float.IsNaN(_lastRearGainDb) || MathF.Abs(rearGainDb - _lastRearGainDb) > 0.3f)
+                {
+                    _rearShadowL.SetPeak(_sampleRate, 4500f, rearGainDb, 1.0f);
+                    _rearShadowR.SetPeak(_sampleRate, 4500f, rearGainDb, 1.0f);
+                    _lastRearGainDb = rearGainDb;
+                }
+
+                var rearL = _rearShadowL.Process(spatialLeft);
+                var rearR = _rearShadowR.Process(spatialRight);
+                spatialLeft = Lerp(spatialLeft, rearL, _rearBlend);
+                spatialRight = Lerp(spatialRight, rearR, _rearBlend);
             }
-            else
+
+            if (_frontBlend > 0f)
             {
-                rightGain *= 1f - farEarShadow;
-                leftGain *= 1f + lateral * 0.08f;
+                var frontGainDb = 3f * front * hrtf;
+                if (float.IsNaN(_lastFrontGainDb) || MathF.Abs(frontGainDb - _lastFrontGainDb) > 0.3f)
+                {
+                    _frontPresenceL.SetPeak(_sampleRate, 3500f, frontGainDb, 1.2f);
+                    _frontPresenceR.SetPeak(_sampleRate, 3500f, frontGainDb, 1.2f);
+                    _lastFrontGainDb = frontGainDb;
+                }
+
+                var frontL = _frontPresenceL.Process(spatialLeft);
+                var frontR = _frontPresenceR.Process(spatialRight);
+                spatialLeft = Lerp(spatialLeft, frontL, _frontBlend);
+                spatialRight = Lerp(spatialRight, frontR, _frontBlend);
             }
 
-            var panEnergy = MathF.Sqrt((leftGain * leftGain + rightGain * rightGain) * 0.5f);
-            if (panEnergy > 0.001f)
-            {
-                leftGain /= panEnergy;
-                rightGain /= panEnergy;
-            }
+            // --- 混响：后方更多（距离感），前方更少（贴耳感）---
+            var wet = Clamp(baseReverb + rear * 0.18f + circle * 0.03f, 0f, 0.72f);
+            _reverb.Process(spatialLeft, spatialRight, wet, out var roomL, out var roomR);
+            spatialLeft = Lerp(spatialLeft, roomL, wet * 0.6f);
+            spatialRight = Lerp(spatialRight, roomR, wet * 0.6f);
 
-            var leftDelaySamples = orbitX > 0f ? orbitX * maxItdSamples : 0f;
-            var rightDelaySamples = orbitX < 0f ? -orbitX * maxItdSamples : 0f;
-            var spatialLeft = _leftDelay.Process(movingSource, leftDelaySamples) * leftGain;
-            var spatialRight = _rightDelay.Process(movingSource, rightDelaySamples) * rightGain;
+            // --- 最终混音 ---
+            interleavedStereo[i] = (leftIn * dryMix + spatialLeft * wetMix + bassCenter * 0.12f) * outputGain;
+            interleavedStereo[i + 1] = (rightIn * dryMix + spatialRight * wetMix + bassCenter * 0.12f) * outputGain;
 
-            var heightTone = 1f + up * 0.025f - down * 0.015f;
-            spatialLeft *= heightTone;
-            spatialRight *= heightTone;
-
-            var wet = Clamp(baseReverb + lateral * 0.04f + up * 0.035f + down * 0.015f, 0f, 0.72f);
-            _reverb.Process(spatialLeft, spatialRight, wet, out var roomLeft, out var roomRight);
-            spatialLeft = Lerp(spatialLeft, roomLeft, wet * 0.62f);
-            spatialRight = Lerp(spatialRight, roomRight, wet * 0.62f);
-
-            var dryLeft = (lowCenter * 0.42f + highLeft * 0.58f) * dryKeep;
-            var dryRight = (lowCenter * 0.42f + highRight * 0.58f) * dryKeep;
-            var bassAnchor = lowCenter * (0.11f + (1f - depth) * 0.22f);
-            interleavedStereo[i] = (dryLeft + spatialLeft * movingGain + bassAnchor) * outputGain;
-            interleavedStereo[i + 1] = (dryRight + spatialRight * movingGain + bassAnchor) * outputGain;
-
+            // --- 推进轨道相位 ---
             _orbitPhase += orbitStep;
-            _heightPhase += heightStep;
             if (_orbitPhase >= TwoPi)
             {
                 _orbitPhase -= TwoPi;
-            }
-
-            if (_heightPhase >= TwoPi)
-            {
-                _heightPhase -= TwoPi;
             }
         }
 
@@ -196,18 +209,6 @@ public sealed class Spatial8DProcessor
 
     private static float Lerp(float a, float b, float t) => a + (b - a) * Clamp(t, 0f, 1f);
 
-    private static float ShapeHeight(float value)
-    {
-        var amount = MathF.Pow(Clamp(MathF.Abs(value), 0f, 1f), 0.72f);
-        return value < 0f ? -amount : amount;
-    }
-
-    private static float Smooth01(float value)
-    {
-        value = Clamp(value, 0f, 1f);
-        return value * value * (3f - 2f * value);
-    }
-
     private static float Clamp(float value, float min, float max)
     {
         if (value < min)
@@ -233,9 +234,15 @@ internal sealed class FractionalDelayLine
     {
         _buffer[_writeIndex] = input;
         var read = _writeIndex - delaySamples;
+        var bufLen = _buffer.Length;
         while (read < 0f)
         {
-            read += _buffer.Length;
+            read += bufLen;
+        }
+
+        while (read >= bufLen)
+        {
+            read -= bufLen;
         }
 
         var index0 = (int)read;
@@ -278,15 +285,15 @@ internal sealed class SimpleStereoReverb
     {
         _left = new FeedbackDelay[]
         {
-            new FeedbackDelay(Ms(sampleRate, 17.9f), 0.48f),
-            new FeedbackDelay(Ms(sampleRate, 31.3f), 0.45f),
-            new FeedbackDelay(Ms(sampleRate, 49.1f), 0.39f)
+            new(Ms(sampleRate, 17.9f), 0.48f),
+            new(Ms(sampleRate, 31.3f), 0.45f),
+            new(Ms(sampleRate, 49.1f), 0.39f)
         };
         _right = new FeedbackDelay[]
         {
-            new FeedbackDelay(Ms(sampleRate, 21.7f), 0.47f),
-            new FeedbackDelay(Ms(sampleRate, 35.9f), 0.43f),
-            new FeedbackDelay(Ms(sampleRate, 55.3f), 0.38f)
+            new(Ms(sampleRate, 21.7f), 0.47f),
+            new(Ms(sampleRate, 35.9f), 0.43f),
+            new(Ms(sampleRate, 55.3f), 0.38f)
         };
     }
 
@@ -342,5 +349,75 @@ internal sealed class FeedbackDelay
         }
 
         return delayed;
+    }
+}
+
+internal sealed class BiquadPeakFilter
+{
+    private const float TwoPi = MathF.PI * 2f;
+    private float _b0 = 1f, _b1, _b2, _a1, _a2;
+    private float _x1, _x2, _y1, _y2;
+
+    public void SetPeak(int sampleRate, float centerFreq, float gainDb, float q)
+    {
+        var w0 = TwoPi * MathF.Min(centerFreq, sampleRate * 0.49f) / sampleRate;
+        var cosW0 = MathF.Cos(w0);
+        var sinW0 = MathF.Sin(w0);
+        var alpha = sinW0 / (2f * q);
+        var a = MathF.Pow(10f, gainDb / 40f);
+
+        _b0 = 1f + alpha * a;
+        _b1 = -2f * cosW0;
+        _b2 = 1f - alpha * a;
+        var a0 = 1f + alpha / a;
+        _a1 = -2f * cosW0 / a0;
+        _a2 = (1f - alpha / a) / a0;
+        _b0 /= a0;
+        _b1 /= a0;
+        _b2 /= a0;
+    }
+
+    public float Process(float input)
+    {
+        var output = _b0 * input + _b1 * _x1 + _b2 * _x2 - _a1 * _y1 - _a2 * _y2;
+        _x2 = _x1;
+        _x1 = input;
+        _y2 = _y1;
+        _y1 = output;
+        return output;
+    }
+}
+
+internal sealed class BiquadLowShelfFilter
+{
+    private const float TwoPi = MathF.PI * 2f;
+    private float _b0 = 1f, _b1, _b2, _a1, _a2;
+    private float _x1, _x2, _y1, _y2;
+
+    public void SetShelf(int sampleRate, float cutoffFreq, float gainDb, float q)
+    {
+        var w0 = TwoPi * MathF.Min(cutoffFreq, sampleRate * 0.49f) / sampleRate;
+        var cosW0 = MathF.Cos(w0);
+        var sinW0 = MathF.Sin(w0);
+        var alpha = sinW0 / (2f * q);
+        var a = MathF.Pow(10f, gainDb / 40f);
+        var sqrtA = MathF.Sqrt(a);
+
+        var a0 = (a + 1f) + (a - 1f) * cosW0 + 2f * sqrtA * alpha;
+        _b0 = a * ((a + 1f) - (a - 1f) * cosW0 + 2f * sqrtA * alpha) / a0;
+        _b1 = 2f * a * ((a - 1f) - (a + 1f) * cosW0) / a0;
+        _b2 = a * ((a + 1f) - (a - 1f) * cosW0 - 2f * sqrtA * alpha) / a0;
+        _a1 = -2f * ((a - 1f) + (a + 1f) * cosW0) / a0;
+        _a2 = ((a + 1f) + (a - 1f) * cosW0 - 2f * sqrtA * alpha) / a0;
+    }
+
+    public float Process(float input)
+    {
+        var output = _b0 * input + _b1 * _x1 + _b2 * _x2 - _a1 * _y1 - _a2 * _y2;
+        _x2 = _x1;
+        _x1 = input;
+        _y2 = _y1;
+        _y1 = output;
+        return output;
     }
 }
