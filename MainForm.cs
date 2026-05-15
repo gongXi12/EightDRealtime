@@ -8,8 +8,8 @@ namespace EightDRealtime;
 public sealed class MainForm : Form
 {
     private readonly Wasapi8DAudioEngine _engine = new();
-    private readonly ComboBox _captureCombo = new();
-    private readonly ComboBox _outputCombo = new();
+    private readonly ThemedComboBox _captureCombo = new();
+    private readonly ThemedComboBox _outputCombo = new();
     private readonly Button _refreshButton = new();
     private readonly Button _startButton = new();
     private readonly Button _stopButton = new();
@@ -410,11 +410,10 @@ public sealed class MainForm : Form
         };
     }
 
-    private void StyleCombo(ComboBox combo)
+    private void StyleCombo(ThemedComboBox combo)
     {
         combo.DropDownStyle = ComboBoxStyle.DropDownList;
         combo.Dock = DockStyle.Fill;
-        combo.FlatStyle = FlatStyle.Flat;
         combo.BackColor = UiPalette.InputBg;
         combo.ForeColor = UiPalette.Text;
         combo.Font = new Font(Font.FontFamily, 9F);
@@ -582,5 +581,81 @@ internal sealed class AppLogoView : Control
         path.AddArc(bounds.Left, bounds.Bottom - diameter, diameter, diameter, 90, 90);
         path.CloseFigure();
         return path;
+    }
+}
+
+internal sealed class ThemedComboBox : ComboBox
+{
+    private static readonly Color ArrowColor = UiPalette.Muted;
+    private static readonly Color BorderColor = UiPalette.CardBorder;
+    private static readonly Color ItemHoverBg = Color.FromArgb(30, 30, 30);
+
+    public ThemedComboBox()
+    {
+        SetStyle(ControlStyles.UserPaint | ControlStyles.AllPaintingInWmPaint | ControlStyles.OptimizedDoubleBuffer, true);
+        DrawMode = DrawMode.OwnerDrawFixed;
+        ItemHeight = (int)(Font.Height * 1.5f);
+    }
+
+    protected override void OnPaint(PaintEventArgs e)
+    {
+        var g = e.Graphics;
+        var rect = ClientRectangle;
+
+        // Background
+        using var bgBrush = new SolidBrush(BackColor);
+        g.FillRectangle(bgBrush, rect);
+
+        // Border
+        using var borderPen = new Pen(BorderColor);
+        g.DrawRectangle(borderPen, rect.X, rect.Y, rect.Width - 1, rect.Height - 1);
+
+        // Dropdown arrow — positioned correctly at high DPI
+        var scale = DeviceDpi / 96f;
+        var arrowSize = (int)(10 * scale);
+        var arrowX = rect.Right - arrowSize - (int)(8 * scale);
+        var arrowY = rect.Y + (rect.Height - arrowSize) / 2;
+
+        using var arrowBrush = new SolidBrush(ArrowColor);
+        var arrowPath = new GraphicsPath();
+        arrowPath.AddPolygon(new[]
+        {
+            new PointF(arrowX, arrowY),
+            new PointF(arrowX + arrowSize, arrowY),
+            new PointF(arrowX + arrowSize / 2f, arrowY + arrowSize * 0.6f)
+        });
+        g.FillPath(arrowBrush, arrowPath);
+
+        // Selected text — truncated with ellipsis, never overlaps arrow
+        if (Items.Count > 0 && SelectedIndex >= 0)
+        {
+            var textRect = new Rectangle(
+                rect.X + (int)(6 * scale),
+                rect.Y,
+                arrowX - rect.X - (int)(10 * scale),
+                rect.Height);
+
+            var flags = TextFormatFlags.Left | TextFormatFlags.VerticalCenter
+                | TextFormatFlags.EndEllipsis | TextFormatFlags.NoPrefix;
+            TextRenderer.DrawText(g, GetItemText(Items[SelectedIndex]), Font, textRect, ForeColor, flags);
+        }
+    }
+
+    protected override void OnDrawItem(DrawItemEventArgs e)
+    {
+        if (e.Index < 0) return;
+
+        var g = e.Graphics;
+        var rect = e.Bounds;
+
+        var isSelected = (e.State & DrawItemState.Selected) == DrawItemState.Selected;
+        using var bg = new SolidBrush(isSelected ? ItemHoverBg : BackColor);
+        g.FillRectangle(bg, rect);
+
+        var textRect = new Rectangle(rect.X + 4, rect.Y, rect.Width - 8, rect.Height);
+        var textColor = isSelected ? Color.White : ForeColor;
+        var flags = TextFormatFlags.Left | TextFormatFlags.VerticalCenter
+            | TextFormatFlags.EndEllipsis | TextFormatFlags.NoPrefix;
+        TextRenderer.DrawText(g, GetItemText(Items[e.Index]), Font, textRect, textColor, flags);
     }
 }
