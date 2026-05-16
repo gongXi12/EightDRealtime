@@ -282,12 +282,12 @@ public sealed class MainForm : Form
         return new SpatialSettings(
             Enabled: true,
             InputGain: 0.84f,
-            OutputGain: 0.80f,
-            RotationHz: 0.12f,
-            Depth: 0.90f,
-            CircleStrength: 3.00f,
+            OutputGain: 0.86f,
+            RotationHz: 0.18f,
+            Depth: 0.93f,
+            CircleStrength: 3.20f,
             HrtfStrength: 1.00f,
-            ReverbWet: 0.28f,
+            ReverbWet: 0.32f,
             LimiterThreshold: 0.88f);
     }
 
